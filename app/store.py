@@ -8,20 +8,41 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.models import (
     Account,
     Assessment,
     ConcurrentSubmissionError,
     DuplicateTransactionError,
+    LIVE_SUBMISSION,
+    NoEffectiveRuleVersionError,
     Rule,
+    RuleEffectiveTimeConflictError,
     RuleValidationError,
     RuleVersion,
     SuspiciousEvent,
     Transaction,
+    TransactionContentConflictError,
     utcnow,
 )
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """naive datetime 按 UTC 处理，保证跨时区/无时区输入的比较口径一致。"""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _txn_time(txn: Transaction) -> datetime:
+    """交易用于判定/计数的发生时刻；实时哨兵取当前时刻。"""
+    return utcnow() if txn.submitted_at == LIVE_SUBMISSION else _as_utc(txn.submitted_at)
+
+
+def resolve_txn_time(txn: Transaction) -> datetime:
+    """交易发生时刻的公开解析入口：实时交易 -> 当前 UTC 时刻。"""
+    return _txn_time(txn)
 
 
 class RiskStore:
@@ -31,8 +52,8 @@ class RiskStore:
         self.transactions: dict[str, Transaction] = {}
         # 已完成的评估结论（每笔交易至多一条）
         self.assessments: dict[str, Assessment] = {}
-        # 进行中的评估占位，用于并发提交冲突检测
-        self.in_flight: set[str] = set()
+        # 进行中的评估占位：txn_id -> 提交内容，用于并发冲突与内容一致性检测
+        self.in_flight: dict[str, Transaction] = {}
         # 规则版本（追加式，永不就地修改）
         self.rule_versions: list[RuleVersion] = []
         # 可疑事件
@@ -52,34 +73,87 @@ class RiskStore:
 
     # ------------------------------------------------------------ 评估占位
 
-    def claim_assessment(self, txn_id: str) -> None:
+    @staticmethod
+    def same_content(a: Transaction, b: Transaction) -> bool:
+        """同一交易号的两次提交关键内容是否一致。
+
+        比对字段：账户、金额、币种、交易对手、交易发生时间（统一到 UTC，
+        因此时区表示不同但时刻相同的输入视为一致；两笔都是"实时"提交时
+        视为同一时刻，不因 utcnow 的微秒差误判为内容冲突）。
+        """
+        if not (
+            a.account_id == b.account_id
+            and a.amount == b.amount
+            and a.currency == b.currency
+            and a.counterparty == b.counterparty
+        ):
+            return False
+        if a.submitted_at == LIVE_SUBMISSION or b.submitted_at == LIVE_SUBMISSION:
+            return a.submitted_at == b.submitted_at
+        return _as_utc(a.submitted_at) == _as_utc(b.submitted_at)
+
+    def claim_assessment(self, txn: Transaction) -> None:
         """占位一笔交易的评估资格。
 
-        - 已有完成结论 -> DuplicateTransactionError
-        - 已有进行中占位 -> ConcurrentSubmissionError
-        二者调用方可据此给出可区分的拒绝原因。
+        - 已有完成结论且内容一致 -> DuplicateTransactionError
+        - 已有完成结论但关键内容对不上 -> TransactionContentConflictError
+        - 已有进行中占位且内容一致 -> ConcurrentSubmissionError
+        - 已有进行中占位但内容对不上 -> TransactionContentConflictError
+        调用方可据此给出彼此可区分的拒绝原因。
         """
         with self._lock:
-            if txn_id in self.assessments:
-                raise DuplicateTransactionError(
-                    f"交易 {txn_id} 已完成评估，重复提交被拒绝"
+            done = self.transactions.get(txn.txn_id)
+            if done is not None:
+                if self.same_content(done, txn):
+                    raise DuplicateTransactionError(
+                        f"交易 {txn.txn_id} 已完成评估，重复提交被拒绝"
+                    )
+                raise TransactionContentConflictError(
+                    f"交易 {txn.txn_id} 已完成评估，但提交内容与原提交不一致"
                 )
-            if txn_id in self.in_flight:
-                raise ConcurrentSubmissionError(
-                    f"交易 {txn_id} 正在评估中，并发提交被拒绝"
+            holder = self.in_flight.get(txn.txn_id)
+            if holder is not None:
+                if self.same_content(holder, txn):
+                    raise ConcurrentSubmissionError(
+                        f"交易 {txn.txn_id} 正在评估中，并发提交被拒绝"
+                    )
+                raise TransactionContentConflictError(
+                    f"交易 {txn.txn_id} 正在评估中，但提交内容与在途提交不一致"
                 )
-            self.in_flight.add(txn_id)
+            self.in_flight[txn.txn_id] = txn
 
     def release_assessment(self, txn_id: str) -> None:
         with self._lock:
-            self.in_flight.discard(txn_id)
+            self.in_flight.pop(txn_id, None)
 
     def commit_assessment(self, txn: Transaction, assessment: Assessment) -> None:
         """原子地落库交易与结论，并释放占位。"""
         with self._lock:
             self.transactions.setdefault(txn.txn_id, txn)
             self.assessments[txn.txn_id] = assessment
-            self.in_flight.discard(txn.txn_id)
+            self.in_flight.pop(txn.txn_id, None)
+
+    def commit_batch(
+        self, records: list[tuple[Transaction, Assessment, SuspiciousEvent | None]]
+    ) -> None:
+        """原子地整批落库：交易+结论（+事件）要么全部写入，要么一个都不写。
+
+        调用前必须已通过 claim 占位；本方法只负责单次临界区内的最终写入，
+        失败（如编号分配异常）时所有 dict 变更随异常回滚，不留半截结论。
+        """
+        with self._lock:
+            # 预分配事件编号：若中途异常，尚未写入任何正式数据
+            prepared: list[tuple[Transaction, Assessment, SuspiciousEvent | None]] = []
+            for txn, assessment, event in records:
+                if event is not None and not event.event_id:
+                    event.event_id = self.next_event_id_locked()
+                prepared.append((txn, assessment, event))
+            for txn, assessment, event in prepared:
+                self.transactions.setdefault(txn.txn_id, txn)
+                self.assessments[txn.txn_id] = assessment
+                self.in_flight.pop(txn.txn_id, None)
+                if event is not None:
+                    self.events[event.event_id] = event
 
     def get_assessment(self, txn_id: str) -> Assessment | None:
         with self._lock:
@@ -90,41 +164,90 @@ class RiskStore:
             return self.transactions.get(txn_id)
 
     def count_account_transactions(
-        self, account_id: str, after: datetime, at_or_before: datetime
+        self,
+        account_id: str,
+        after: datetime,
+        at_or_before: datetime,
+        extra: tuple[Transaction, ...] = (),
     ) -> int:
-        """统计账户在 (after, at_or_before] 时间窗内提交的交易数（含目标笔）。
+        """统计账户在 (after, at_or_before] 时间窗内提交的交易数。
 
-        仅依据 submitted_at，因此在任意时刻重放历史交易时，
-        窗口都不会包含目标交易之后的交易，结论可复现。
+        默认只数已落库交易；``extra`` 为补录批次中尚未落库的交易，
+        使同一批补录在窗口内互相可见，批次首评结论与落库后单独重放一致。
+        仅依据 submitted_at，因此任意时刻重放历史交易时，窗口都不会
+        滑入未来交易，结论可复现。
         """
+        after_u = _as_utc(after)
+        before_u = _as_utc(at_or_before)
         with self._lock:
+            sources = list(self.transactions.values())
+            sources.extend(extra)
             return sum(
                 1
-                for txn in self.transactions.values()
+                for txn in sources
                 if txn.account_id == account_id
-                and after < txn.submitted_at <= at_or_before
+                and after_u < _txn_time(txn) <= before_u
             )
 
     # ------------------------------------------------------------ 规则版本
 
     def append_rule_version(
-        self, rules: tuple[Rule, ...], note: str = "", created_at: datetime | None = None
+        self,
+        rules: tuple[Rule, ...],
+        note: str = "",
+        created_at: datetime | None = None,
+        effective_at: datetime | None = None,
     ) -> RuleVersion:
-        """追加一个新版本；版本号单调递增，旧版本保持不变。"""
+        """追加一个新版本；版本号单调递增，旧版本保持不变。
+
+        生效时间语义：``effective_at`` 必须严格晚于已存在的最新版本的
+        生效时间（更早或与某个已存在版本撞点都会让历史结论说不清），
+        违反时抛 :class:`RuleEffectiveTimeConflictError`，整批拒绝，
+        不追加任何版本。未显式给出生效时间时取当前时刻。
+        """
         with self._lock:
+            created = _as_utc(created_at or utcnow())
+            effective = _as_utc(effective_at or created)
+            if self.rule_versions:
+                last_effective = _as_utc(self.rule_versions[-1].effective_at)
+                if effective <= last_effective:
+                    raise RuleEffectiveTimeConflictError(
+                        f"新版本生效时间 {effective.isoformat()} 不晚于已有最新版本的"
+                        f"生效时间 {last_effective.isoformat()}，整批拒绝"
+                        "（不挑选版本凑合生效）"
+                    )
             version = len(self.rule_versions) + 1
             rv = RuleVersion(
                 version=version,
                 rules=tuple(rules),
-                created_at=created_at or utcnow(),
+                created_at=created,
+                effective_at=effective,
                 note=note,
             )
             self.rule_versions.append(rv)
             return rv
 
     def current_rule_version(self) -> RuleVersion | None:
+        """当前时刻已生效的最新版本；所有版本都在未来生效时返回 None。"""
+        with self._lock:
+            return self.effective_rule_version_at_utc(utcnow())
+
+    def latest_rule_version(self) -> RuleVersion | None:
+        """已发布的最新版本（不考虑是否已生效）。"""
         with self._lock:
             return self.rule_versions[-1] if self.rule_versions else None
+
+    def effective_rule_version_at_utc(self, at: datetime) -> RuleVersion | None:
+        """返回某时刻生效的规则版本（effective_at <= at 的最新版本），无则 None。"""
+        with self._lock:
+            at_u = _as_utc(at)
+            chosen: RuleVersion | None = None
+            for rv in self.rule_versions:
+                if _as_utc(rv.effective_at) <= at_u and (
+                    chosen is None or rv.version > chosen.version
+                ):
+                    chosen = rv
+            return chosen
 
     def get_rule_version(self, version: int) -> RuleVersion:
         with self._lock:
@@ -133,22 +256,24 @@ class RiskStore:
             raise RuleValidationError(f"规则版本 {version} 不存在")
 
     def effective_rule_version(self, at: datetime) -> RuleVersion:
-        """返回某时刻生效的规则版本（created_at <= at 的最新版本）。"""
-        with self._lock:
-            chosen: RuleVersion | None = None
-            for rv in self.rule_versions:
-                if rv.created_at <= at and (chosen is None or rv.version > chosen.version):
-                    chosen = rv
-            if chosen is None:
-                raise RuleValidationError(f"时刻 {at.isoformat()} 没有生效的规则版本")
-            return chosen
+        """返回某时刻生效的规则版本；早于最早版本生效时间则明确拒绝。"""
+        chosen = self.effective_rule_version_at_utc(at)
+        if chosen is None:
+            raise NoEffectiveRuleVersionError(
+                f"交易发生时刻 {_as_utc(at).isoformat()} 早于系统中最早生效的"
+                "规则版本，不允许拿最新规则套用历史交易"
+            )
+        return chosen
 
     # ------------------------------------------------------------ 可疑事件
 
     def next_event_id(self) -> str:
         with self._lock:
-            self._event_seq += 1
-            return f"EVT-{self._event_seq:06d}"
+            return self.next_event_id_locked()
+
+    def next_event_id_locked(self) -> str:
+        self._event_seq += 1
+        return f"EVT-{self._event_seq:06d}"
 
     def save_event(self, event: SuspiciousEvent) -> SuspiciousEvent:
         with self._lock:

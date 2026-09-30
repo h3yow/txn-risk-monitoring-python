@@ -12,6 +12,11 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# 实时交易（未显式给出发生时间）的哨兵值：内容比对时两笔"实时"提交
+# 永远一致，实时取版按当前生效版本处理，不受两次调用 utcnow 的微秒差影响。
+LIVE_SUBMISSION = datetime.min.replace(tzinfo=timezone.utc)
+
+
 # ---------------------------------------------------------------- 枚举
 
 class RuleType(str, Enum):
@@ -49,7 +54,23 @@ class ConcurrentSubmissionError(RiskError):
 
 
 class RuleValidationError(RiskError):
-    """规则集结构或取值非法，整批拒绝。"""
+    """规则集结构或取值非法，整批拒绝（规则内容本身非法）。"""
+
+
+class RuleEffectiveTimeConflictError(RiskError):
+    """新版本生效时间不晚于已有版本的生效时间（早于或撞点），整批拒绝。
+
+    与 :class:`RuleValidationError`（规则内容非法）相互区分：
+    本异常表示规则内容合法，但生效时间语义会让历史结论说不清。
+    """
+
+
+class TransactionContentConflictError(RiskError):
+    """同一交易号已存在/在途，但提交的关键内容与原提交对不上。"""
+
+
+class NoEffectiveRuleVersionError(RiskError):
+    """交易发生时刻早于系统中最早生效的规则版本，没有可适用的规则。"""
 
 
 class InvalidTransitionError(RiskError):
@@ -72,7 +93,8 @@ class Transaction:
     amount: float
     currency: str
     counterparty: str
-    submitted_at: datetime = field(default_factory=utcnow)
+    # 默认为实时提交哨兵；补录历史交易必须显式给出真实发生时间
+    submitted_at: datetime = LIVE_SUBMISSION
 
 
 @dataclass(frozen=True)
@@ -88,6 +110,7 @@ class RuleVersion:
     version: int
     rules: tuple[Rule, ...]
     created_at: datetime
+    effective_at: datetime
     note: str = ""
 
 

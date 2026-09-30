@@ -61,6 +61,22 @@ class EventService:
     def __init__(self, store: RiskStore) -> None:
         self.store = store
 
+    def build_event(
+        self, txn: Transaction, assessment: Assessment
+    ) -> SuspiciousEvent:
+        """构造一个尚未分配编号、未落库的事件（供批量原子提交统一写入）。
+
+        同一交易至多一个事件的去重由调用方（store 临界区）保证。
+        编号在 ``commit_batch`` 临界区内分配，失败时整批都不会落库。
+        """
+        return SuspiciousEvent(
+            event_id="",
+            txn_id=txn.txn_id,
+            status=EventStatus.OPEN,
+            assessment_snapshot=assessment,
+            transaction_snapshot=txn,
+        )
+
     def create_event(
         self, txn: Transaction, assessment: Assessment
     ) -> SuspiciousEvent:
@@ -70,13 +86,8 @@ class EventService:
             raise InvalidTransitionError(
                 f"交易 {txn.txn_id} 已存在事件 {existing.event_id}"
             )
-        event = SuspiciousEvent(
-            event_id=self.store.next_event_id(),
-            txn_id=txn.txn_id,
-            status=EventStatus.OPEN,
-            assessment_snapshot=assessment,
-            transaction_snapshot=txn,
-        )
+        event = self.build_event(txn, assessment)
+        event.event_id = self.store.next_event_id()
         self.store.save_event(event)
         logger.info(
             "[EVENT-OPEN] event_id=%s txn_id=%s rule_version=%s hits=%d",

@@ -3,8 +3,11 @@
 异常响应通过 ``error.code`` 区分拒绝原因：
 - ``DUPLICATE_TRANSACTION``：交易已评估过的重复提交（HTTP 409）
 - ``CONCURRENT_SUBMISSION``：同一交易进行中的并发提交（HTTP 409）
+- ``TRANSACTION_CONTENT_CONFLICT``：同一交易号但关键内容对不上（HTTP 409）
+- ``RULE_EFFECTIVE_TIME_CONFLICT``：新版本生效时间不晚于已有版本（HTTP 409）
+- ``NO_EFFECTIVE_RULE_VERSION``：交易发生时刻早于最早生效规则版本（HTTP 422）
 - ``INVALID_TRANSITION``：非法事件状态流转（HTTP 409）
-- ``INVALID_RULESET``：规则集非法，整批拒绝（HTTP 422）
+- ``INVALID_RULESET``：规则集内容非法，整批拒绝（HTTP 422）
 """
 
 from __future__ import annotations
@@ -20,7 +23,10 @@ from app.models import (
     ConcurrentSubmissionError,
     DuplicateTransactionError,
     InvalidTransitionError,
+    NoEffectiveRuleVersionError,
+    RuleEffectiveTimeConflictError,
     RuleValidationError,
+    TransactionContentConflictError,
 )
 from app.service import RiskMonitoringService
 
@@ -38,6 +44,7 @@ class AccountIn(BaseModel):
 class RulesIn(BaseModel):
     rules: list[dict[str, Any]]
     note: str = ""
+    effective_at: datetime | None = None
 
 
 class TransactionIn(BaseModel):
@@ -47,6 +54,20 @@ class TransactionIn(BaseModel):
     currency: str = "CNY"
     counterparty: str = ""
     submitted_at: datetime | None = None
+
+
+class BackfillItem(BaseModel):
+    # 补录必须显式给出交易发生时刻
+    txn_id: str
+    account_id: str
+    amount: float = Field(gt=0)
+    currency: str = "CNY"
+    counterparty: str = ""
+    submitted_at: datetime
+
+
+class BackfillIn(BaseModel):
+    transactions: list[BackfillItem]
 
 
 class ReplayIn(BaseModel):
@@ -73,6 +94,21 @@ def _dup_handler(_request, exc: DuplicateTransactionError) -> JSONResponse:
 @app.exception_handler(ConcurrentSubmissionError)
 def _concurrent_handler(_request, exc: ConcurrentSubmissionError) -> JSONResponse:
     return _error("CONCURRENT_SUBMISSION", str(exc), 409)
+
+
+@app.exception_handler(TransactionContentConflictError)
+def _content_conflict_handler(_request, exc: TransactionContentConflictError) -> JSONResponse:
+    return _error("TRANSACTION_CONTENT_CONFLICT", str(exc), 409)
+
+
+@app.exception_handler(RuleEffectiveTimeConflictError)
+def _effective_time_handler(_request, exc: RuleEffectiveTimeConflictError) -> JSONResponse:
+    return _error("RULE_EFFECTIVE_TIME_CONFLICT", str(exc), 409)
+
+
+@app.exception_handler(NoEffectiveRuleVersionError)
+def _no_effective_handler(_request, exc: NoEffectiveRuleVersionError) -> JSONResponse:
+    return _error("NO_EFFECTIVE_RULE_VERSION", str(exc), 422)
 
 
 @app.exception_handler(InvalidTransitionError)
@@ -105,7 +141,9 @@ def create_account(body: AccountIn) -> dict[str, str]:
 
 @app.post("/rules/versions", status_code=201)
 def publish_rules(body: RulesIn) -> dict[str, Any]:
-    version = svc.publish_rules(body.rules, note=body.note)
+    version = svc.publish_rules(
+        body.rules, note=body.note, effective_at=body.effective_at
+    )
     return {"version": version}
 
 
@@ -136,6 +174,41 @@ def submit_transaction(body: TransactionIn) -> dict[str, Any]:
             for h in a.hits
         ],
         "event_id": event.event_id if event else None,
+    }
+
+
+@app.post("/transactions/backfill", status_code=201)
+def backfill_transactions(body: BackfillIn) -> dict[str, Any]:
+    """整批补录历史交易：按每笔交易自身发生时刻生效的规则版本判定。
+
+    全批原子：任一笔失败（重复/并发/内容冲突/无生效版本等）整批拒绝，
+    响应体 ``error.code`` 给出可区分的拒绝原因，不留下半截结论或事件。
+    """
+    results = svc.backfill_transactions(
+        [item.model_dump() for item in body.transactions]
+    )
+    return {
+        "count": len(results),
+        "results": [
+            {
+                "txn_id": a.txn_id,
+                "decision": a.decision.value,
+                "score": a.score,
+                "rule_version": a.rule_version,
+                "hits": [
+                    {
+                        "rule_id": h.rule_id,
+                        "rule_type": h.rule_type.value,
+                        "rule_version": h.rule_version,
+                        "reason": h.reason,
+                    }
+                    for h in a.hits
+                ],
+                "event_id": event.event_id if event else None,
+            }
+            for result in results
+            for a, event in [(result["assessment"], result["event"])]
+        ],
     }
 
 

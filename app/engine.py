@@ -1,9 +1,14 @@
-"""风险判定引擎：去重、并发冲突、按规则版本快照评估、历史重放。
+"""风险判定引擎：去重/并发/内容冲突、按规则版本快照评估、历史补录与重放。
 
 一致性保证：
 - 评估资格通过 :meth:`RiskStore.claim_assessment` 原子占位，
-  已完成结论 -> ``DuplicateTransactionError``；进行中 -> ``ConcurrentSubmissionError``，
-  两种拒绝原因可区分，且不会产生重复命中/计分/告警。
+  已完成结论且内容一致 -> ``DuplicateTransactionError``；
+  在途占位且内容一致 -> ``ConcurrentSubmissionError``；
+  同交易号但关键内容对不上 -> ``TransactionContentConflictError``，
+  三种拒绝原因彼此可区分，且不会产生重复命中/计分/告警。
+- 实时交易按当前已生效版本判定；补录交易（``assess_historical``）按交易
+  自身发生时刻生效的版本判定，同批待落库交易进入 velocity 窗口，
+  使批次首评与落库后重放结论一致。
 - 结论中固化规则版本号与命中明细，规则版本只追加不改写，
   因此历史结论永不被后续规则升级影响，并可按当时版本原样重放。
 """
@@ -16,6 +21,7 @@ from datetime import timedelta
 from app.models import (
     Assessment,
     Decision,
+    LIVE_SUBMISSION,
     Rule,
     RuleHit,
     RuleType,
@@ -24,7 +30,7 @@ from app.models import (
     Transaction,
     utcnow,
 )
-from app.store import RiskStore
+from app.store import RiskStore, resolve_txn_time
 
 logger = logging.getLogger("risk.engine")
 
@@ -40,8 +46,13 @@ class AssessmentEngine:
     # ------------------------------------------------------------ 公开入口
 
     def assess(self, txn: Transaction) -> Assessment:
-        """评估一笔交易；重复/并发提交将被明确拒绝。"""
-        self.store.claim_assessment(txn.txn_id)
+        """评估一笔实时交易；重复/并发/内容冲突提交将被明确拒绝。
+
+        实时交易按"当前时刻已生效的最新规则版本"判定，行为与补录不同：
+        补录交易按交易自身的发生时刻选取规则版本（见
+        :meth:`RiskMonitoringService.backfill_transactions`）。
+        """
+        self.store.claim_assessment(txn)
         try:
             rv = self.store.current_rule_version()
             if rv is None:
@@ -65,27 +76,54 @@ class AssessmentEngine:
         txn = self.store.get_transaction(txn_id)
         if txn is None:
             raise RuleValidationError(f"交易 {txn_id} 不存在，无法重放")
-        rv = (
-            self.store.get_rule_version(version)
-            if version is not None
-            else self.store.effective_rule_version(txn.submitted_at)
-        )
+        if version is not None:
+            rv = self.store.get_rule_version(version)
+        elif txn.submitted_at == LIVE_SUBMISSION:
+            # 实时交易：按重放时刻已生效的最新版本（通常与首评版本相同）
+            rv = self.store.current_rule_version()
+            if rv is None:
+                raise RuleValidationError("当前没有任何生效的规则版本，无法重放")
+        else:
+            rv = self.store.effective_rule_version(txn.submitted_at)
         # 重放时交易已落库，时间窗查询会包含目标笔本身
-        assessment = self._evaluate(txn, rv, include_current=False)
+        assessment = self._evaluate(
+            txn, rv, include_current=False, extra=()
+        )
         self._log_assessment(assessment, rv, prefix="REPLAY")
         return assessment
+
+    def assess_historical(
+        self,
+        txn: Transaction,
+        extra: tuple[Transaction, ...] = (),
+    ) -> Assessment:
+        """按交易自身发生时刻生效的规则版本评估一笔（补录）交易。
+
+        ``extra`` 是同一补录批次中尚未落库的交易，用于 velocity 计数，
+        保证批次首评的窗口与整批落库后单独重放的窗口完全一致。
+        交易发生时刻早于最早生效版本时抛 ``NoEffectiveRuleVersionError``。
+        """
+        if txn.submitted_at == LIVE_SUBMISSION:
+            raise RuleValidationError("补录交易必须显式给出真实发生时间 submitted_at")
+        rv = self.store.effective_rule_version(txn.submitted_at)
+        # extra 已含目标笔自身，统计口径与落库后重放完全一致，不再额外 +1
+        return self._evaluate(txn, rv, include_current=False, extra=extra)
 
     # ------------------------------------------------------------ 评估内核
 
     def _evaluate(
-        self, txn: Transaction, rv: RuleVersion, include_current: bool
+        self,
+        txn: Transaction,
+        rv: RuleVersion,
+        include_current: bool,
+        extra: tuple[Transaction, ...] = (),
     ) -> Assessment:
         hits: list[RuleHit] = []
         score = 0
         for rule in rv.rules:
             if not rule.enabled:
                 continue
-            hit = self._check_rule(rule, txn, rv.version, include_current)
+            hit = self._check_rule(rule, txn, rv.version, include_current, extra)
             if hit is not None:
                 hits.append(hit)
                 score += int(rule.params["score"])
@@ -112,6 +150,7 @@ class AssessmentEngine:
         txn: Transaction,
         version: int,
         include_current: bool,
+        extra: tuple[Transaction, ...] = (),
     ) -> RuleHit | None:
         p = rule.params
         if rule.rule_type == RuleType.AMOUNT_LIMIT:
@@ -132,13 +171,15 @@ class AssessmentEngine:
                 )
         elif rule.rule_type == RuleType.VELOCITY:
             window = timedelta(minutes=int(p["window_minutes"]))
+            occurred_at = resolve_txn_time(txn)
             count = self.store.count_account_transactions(
                 txn.account_id,
-                after=txn.submitted_at - window,
-                at_or_before=txn.submitted_at,
+                after=occurred_at - window,
+                at_or_before=occurred_at,
+                extra=extra,
             )
             if include_current:
-                count += 1  # 实时评估时目标笔尚未落库
+                count += 1  # 实时/补录首评时目标笔尚未落库
             if count > p["max_count"]:
                 return RuleHit(
                     rule.rule_id,
@@ -150,6 +191,12 @@ class AssessmentEngine:
                     ),
                 )
         return None
+
+    def log_assessment(
+        self, assessment: Assessment, prefix: str = "ASSESS"
+    ) -> None:
+        rv = self.store.get_rule_version(assessment.rule_version)
+        self._log_assessment(assessment, rv, prefix=prefix)
 
     @staticmethod
     def _log_assessment(
