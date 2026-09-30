@@ -12,6 +12,13 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_utc(dt: datetime) -> datetime:
+    """把无时区信息的时间按 UTC 处理；有时区信息的原样返回。"""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 # ---------------------------------------------------------------- 枚举
 
 class RuleType(str, Enum):
@@ -48,8 +55,24 @@ class ConcurrentSubmissionError(RiskError):
     """同一笔交易正在被并发评估（进行中的冲突）。"""
 
 
+class TransactionContentMismatchError(RiskError):
+    """同一交易号再次提交，但关键内容与首次提交对不上。"""
+
+
 class RuleValidationError(RiskError):
     """规则集结构或取值非法，整批拒绝。"""
+
+
+class RuleEffectiveTimeConflictError(RiskError):
+    """新版本生效时间不晚于已有版本（或与已有版本同一时刻），整批拒绝。
+
+    与规则内容非法（:class:`RuleValidationError`）区分：本异常表示
+    规则内容本身合法，但时间线不合法，发布将会让历史结论说不清。
+    """
+
+
+class NoEffectiveRuleVersionError(RiskError):
+    """交易发生时刻早于系统中最早生效的规则版本，拒绝硬套最新规则。"""
 
 
 class InvalidTransitionError(RiskError):
@@ -87,7 +110,7 @@ class Rule:
 class RuleVersion:
     version: int
     rules: tuple[Rule, ...]
-    created_at: datetime
+    effective_at: datetime
     note: str = ""
 
 

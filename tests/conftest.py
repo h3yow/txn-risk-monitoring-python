@@ -2,10 +2,15 @@
 交易标识、规则版本与判定依据（risk.engine / risk.events logger）。"""
 
 import logging
+from datetime import datetime, timezone
 
 import pytest
 
 from app.service import RiskMonitoringService
+
+# v1 固定从 2000-01-01 生效：既早于用例中所有显式 submitted_at（2026 年内），
+# 也早于任意一天执行测试的"当前时刻"，因此实时/补录结论都不依赖跑用例当天的日期。
+V1_EFFECTIVE_AT = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 V1_RULES = [
     {
@@ -36,7 +41,7 @@ def _enable_engine_logs(caplog):
 @pytest.fixture
 def svc() -> RiskMonitoringService:
     s = RiskMonitoringService()
-    s.publish_rules(V1_RULES, note="初始版本 v1")
+    s.publish_rules(V1_RULES, note="初始版本 v1", effective_at=V1_EFFECTIVE_AT)
     s.create_account("ACC-1")
     s.create_account("ACC-2")
     return s

@@ -61,22 +61,32 @@ class EventService:
     def __init__(self, store: RiskStore) -> None:
         self.store = store
 
-    def create_event(
+    def build_event(
         self, txn: Transaction, assessment: Assessment
     ) -> SuspiciousEvent:
-        """基于一笔可疑交易的结论创建事件；同一交易至多一个事件。"""
+        """构造（不落库）一个可疑事件，供批量评估在原子区内使用。
+
+        调用方负责在同一原子临界区里把事件与结论一起提交；
+        同一交易至多一个事件（已存在则拒绝）。
+        """
         existing = self.find_by_txn(txn.txn_id)
         if existing is not None:
             raise InvalidTransitionError(
                 f"交易 {txn.txn_id} 已存在事件 {existing.event_id}"
             )
-        event = SuspiciousEvent(
+        return SuspiciousEvent(
             event_id=self.store.next_event_id(),
             txn_id=txn.txn_id,
             status=EventStatus.OPEN,
             assessment_snapshot=assessment,
             transaction_snapshot=txn,
         )
+
+    def create_event(
+        self, txn: Transaction, assessment: Assessment
+    ) -> SuspiciousEvent:
+        """基于一笔可疑交易的结论创建事件；同一交易至多一个事件。"""
+        event = self.build_event(txn, assessment)
         self.store.save_event(event)
         logger.info(
             "[EVENT-OPEN] event_id=%s txn_id=%s rule_version=%s hits=%d",

@@ -63,7 +63,7 @@ def test_v2_upgrade_does_not_change_historical_conclusion(svc):
              "params": {"counterparties": ["NEW-BAD"], "score": 200}},
         ],
         note="限额上调、velocity 停用",
-        created_at=T0 + timedelta(days=1),
+        effective_at=T0 + timedelta(days=1),
     )
     assert v2 == 2
 
@@ -100,7 +100,7 @@ def test_replay_with_explicit_new_version_shows_difference_but_keeps_history(svc
             {"rule_id": "BL-1", "rule_type": "blocklist",
              "params": {"counterparties": ["BAD-CORP"], "score": 200}},
         ],
-        created_at=T0 + timedelta(days=1),
+        effective_at=T0 + timedelta(days=1),
     )
 
     # 显式用 v2 复算：1500 < 5000 且不命中黑名单 -> pass（展示差异）
@@ -134,7 +134,7 @@ def test_new_txn_after_upgrade_uses_v2(svc):
             {"rule_id": "AMT-5000", "rule_type": "amount_limit",
              "params": {"limit": 5000, "score": 120}},
         ],
-        created_at=T0 + timedelta(days=1),
+        effective_at=T0 + timedelta(days=1),
     )
     result = svc.submit_transaction(
         txn_id="T-NEW-1",

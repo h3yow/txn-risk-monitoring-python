@@ -49,10 +49,10 @@ def test_concurrent_submissions_exactly_one_wins(svc, monkeypatch):
     entered = threading.Event()
     original_evaluate = engine_mod.AssessmentEngine._evaluate
 
-    def blocking_evaluate(self, txn, rv, include_current):
+    def blocking_evaluate(self, txn, rv, pending):
         entered.set()
         release.wait(timeout=5)
-        return original_evaluate(self, txn, rv, include_current)
+        return original_evaluate(self, txn, rv, pending)
 
     monkeypatch.setattr(
         engine_mod.AssessmentEngine, "_evaluate", blocking_evaluate
@@ -100,10 +100,10 @@ def test_concurrent_then_sequential_reasons_are_distinguishable(svc, monkeypatch
     entered = threading.Event()
     original_evaluate = engine_mod.AssessmentEngine._evaluate
 
-    def blocking_evaluate(self, txn, rv, include_current):
+    def blocking_evaluate(self, txn, rv, pending):
         entered.set()
         release.wait(timeout=5)
-        return original_evaluate(self, txn, rv, include_current)
+        return original_evaluate(self, txn, rv, pending)
 
     monkeypatch.setattr(
         engine_mod.AssessmentEngine, "_evaluate", blocking_evaluate
