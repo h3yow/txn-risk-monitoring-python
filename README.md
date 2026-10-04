@@ -11,10 +11,12 @@
 提交交易（两条入口，判定内核相同）
   │
   ├─ 实时通道 POST /transactions（未给发生时间）
-  │     按"当前时刻已生效的最新版本"判定
+  │     按"当前时刻已生效的最新版本"判定；评估入口冻结一次发生时刻，
+  │     供 velocity 窗口累计与默认重放共用（live 通道独立计数）
   │
   ├─ 补录通道 POST /transactions/backfill（必须给 submitted_at）
   │     按交易自身发生时刻 effective_at <= submitted_at 的最新版本判定
+  │     （historical 通道独立计数，不与实时笔数串用）
   │
   ├─ 1. 原子占位 claim_assessment（RLock 临界区）
   │       已完成结论且内容一致 ──► DuplicateTransactionError        （重复提交）
@@ -34,6 +36,21 @@
 实时通道未给 `submitted_at` 时使用"实时"哨兵（不会因两次调用 `utcnow()` 的微秒差，
 把同一笔的重复/并发重试误判为内容冲突）；补录必须显式给出真实发生时刻。
 评估失败会释放占位（`release_assessment`），避免同笔交易被永久误判为"并发中"。
+
+**实时交易的发生时刻在评估入口冻结一次**：正常当下提交（不给 `submitted_at`）时，
+系统在评估开始时取一次当前 UTC 时刻作为这笔交易的"发生时刻"并随结论一起固化。
+此后选规则版本、velocity 时间窗累计、默认重放都只用这个冻结时刻，
+不会在每次计数/重放时重新取当前时间。因此：
+
+- 同一账户短时间内连续提交的实时交易按真实提交间隔进入时间窗累计，
+  窗口内笔数（含当前笔）超过 `max_count` 即命中并给分；未超阈值的笔不会误命中。
+- 一笔实时交易的**首次结论与之后单独重放（不带版本参数）完全一致**——
+  规则版本、命中规则、分值、最终结论逐项对得上；即使之后发布了更新的规则版本，
+  默认重放仍按该笔冻结时刻生效的版本复算，不会出现"首评命中、重放不命中"或反过来。
+
+**两条通道的 velocity 时间窗计数相互独立、互不污染**：实时通道（`live`）只累计
+实时交易，补录通道（`historical`）只累计带发生时刻的补录交易。两条通道的交易
+即便发生时刻重叠，也不会把对方的笔数算进自己的窗口。
 
 **同一交易号的内容指纹**包含：账户、金额、币种、交易对手、发生时刻
 （时区统一到 UTC，`+00:00` 与等价的 `+08:00` 表示视为同一时刻）。
@@ -68,12 +85,15 @@
 - **历史不变**：历史交易的结论落库后不再变化；事件中也保存结论快照。
   规则升级后，旧交易仍保留当时的 `rule_version` 与命中明细。
 - **可重放**：
-  - `POST /transactions/{txn_id}/replay`（不带版本）→ 取交易 `submitted_at`
-    时刻生效的规则版本复算，默认与首次结论一致；
+  - `POST /transactions/{txn_id}/replay`（不带版本）→ 取该笔交易"发生时刻"
+    生效的规则版本复算，默认与首次结论一致：
+    - 补录交易的发生时刻即其 `submitted_at`；
+    - 实时交易的发生时刻即评估时冻结的那个当前时刻（而非重放时的当前时刻）。
   - 显式传 `{"version": n}` → 用任意历史/新版本复算以展示差异，
     但**不会覆盖**已落库的历史结论。
-  - velocity 规则仅按 `submitted_at` 之前（含自身）的交易计数，
-    重放时窗口不会滑入未来交易，保证结论可复现。
+  - velocity 规则只按"该笔发生时刻之前（含自身）"的交易计数，
+    重放时窗口不会滑入更晚的交易，结论可复现；且 live / historical
+    两个通道各自计数，互不串用。
 - **整批校验、整批拒绝**：一批规则中任意一条结构/取值非法（类型不支持、参数越界、
   `rule_id` 缺失或批次内重复、`enabled` 非布尔、params 非对象等），
   立即抛 `RuleValidationError`（HTTP 422），**不产生新版本**。
@@ -98,8 +118,12 @@
   批次内互不冲突的其余交易在失败后仍可重新提交。
 - **与实时通道并发交叠**：补录批次评估期间，实时通道提交同一交易号同样经过
   原子占位仲裁，并发冲突 / 重复 / 内容冲突三种原因可区分。
-- **实时通道行为不变**：正常当下提交（不给 `submitted_at`）仍按当前已生效的
-  最新版本判定，幂等与并发拒绝语义保持不变。
+- **时间窗计数互不污染**：补录交易（historical）与实时交易（live）即使发生时刻
+  交叠，velocity 也只在各自通道内累计——补录不会抬高实时窗口的笔数，实时连续
+  提交也不会抬高补录窗口的笔数。
+- **实时通道行为**：正常当下提交（不给 `submitted_at`）按当前已生效的最新版本
+  判定，短时间内连续多笔正常参与频次累计（超阈值命中、给分；未超不误命中），
+  首评与不带版本重放一致；幂等与并发拒绝语义保持不变。
 
 兼容范围说明：补录结论的可复现性以"补录批次整批落库完成后"的存储状态为准；
 velocity 窗口天然只回看发生时刻之前（含自身）的交易，因此之后补入更早的交易
@@ -153,13 +177,36 @@ velocity 窗口天然只回看发生时刻之前（含自身）的交易，因�
 
 ```bash
 uv sync                                   # 安装依赖（含 pytest）
-uv run pytest                             # 全部单测（41 个），日志含 txn_id / rule_version / 判定依据
-uv run pytest --log-cli-level=INFO        # 查看 ASSESS / BACKFILL / REPLAY / EVENT 判定日志
+uv run pytest                             # 全部单测（50 个）；实时输出业务日志
+uv run pytest -q                          # 只看用例结果（-v 与 log_cli 已在 pyproject 内默认开启）
+uv run pytest tests/test_live_velocity_replay.py   # 只跑实时频次/重放/交叠回归
 uv run python main.py                     # 启动服务 http://127.0.0.1:8000/docs
 # 或：uv run uvicorn app.api:app --reload
 ```
 
-手工冒烟：
+`pytest` 默认开启 `-v` 与 `log_cli`：每个用例名下会实时打印 `risk.*` 业务日志
+（`[ASSESS]` 首评、`[REPLAY]` 重放、`[BACKFILL]` 补录、`[RULES-PUBLISH]` 发版、
+`[EVENT-*]` 事件处置），可直接看出该用例覆盖了哪块业务、命中了哪些规则、
+分值与最终结论，同时屏蔽了 httpx 传输层噪音。
+
+手工冒烟（实时频次：连续提交同账户多笔，第 3 笔命中 velocity；首评/重放一致）：
+
+```bash
+curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"account_id":"ACC-1"}'
+# 发布带明确生效时间的 v1：5 分钟内 >2 笔命中
+curl -s -X POST localhost:8000/rules/versions -H 'Content-Type: application/json' \
+  -d '{"note":"v1","effective_at":"2026-01-01T00:00:00Z","rules":[
+    {"rule_id":"VEL-2-5M","rule_type":"velocity","params":{"window_minutes":5,"max_count":2,"score":50}}]}'
+# 同账户连续提交 3 笔（不同交易号），第 3 笔 decision=review、score=50
+curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' -d '{"txn_id":"T-1","account_id":"ACC-1","amount":10}'
+curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' -d '{"txn_id":"T-2","account_id":"ACC-1","amount":10}'
+curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' -d '{"txn_id":"T-3","account_id":"ACC-1","amount":10}'
+# 不带版本重放 T-3：规则版本/命中/分值/结论与首评完全一致
+curl -s -X POST localhost:8000/transactions/T-3/replay -H 'Content-Type: application/json'
+curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' -d '{"txn_id":"T-1","account_id":"ACC-1","amount":10}'   # 409 DUPLICATE_TRANSACTION
+```
+
+历史补录冒烟：
 
 ```bash
 curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"account_id":"ACC-1"}'
@@ -184,18 +231,21 @@ curl -s -X POST localhost:8000/transactions/H-1/replay -H 'Content-Type: applica
 | `tests/test_rule_versions_replay.py` | 非法规则整批拒绝且不产生新版本、v2 升级不改历史结论、默认/指定版本重放、重放不覆盖历史 |
 | `tests/test_event_transitions.py` | 合法全链路、非法流转拒绝且不留痕、终态约束、未知动作、事件快照可追溯 |
 | `tests/test_backfill.py` | 生效时间单调/撞点/早于的区分化拒绝、未来版本不提前生效、补录按发生时刻取版、首评==重放（含 velocity 同批互见）、不改既有结论与事件、批量全有或全无、重复/并发/内容冲突三因可分、批次内重复/冲突、与实时通道并发交叠、时区等价表示、实时通道行为不变 |
+| `tests/test_live_velocity_replay.py` | 实时连续多笔：阈值内不误命中、第 3 笔（>阈值）命中给分、窗口外不累计、按账户隔离；首评==不带版本重放（版本/命中/分值/结论），发新版后默认重放仍锁定首评版本；实时与补录时间窗计数双向不污染、补录自身频次语义不被破坏 |
 | `tests/test_api.py` | HTTP 错误码区分、422 整批拒绝、非法流转 409、事件追溯详情、补录/生效时间/无生效版本的 HTTP 码 |
 
 所有补录与版本相关用例都基于固定时间常量（如 `2026-01-01T00:00:00Z`、
-`2026-06-01T10:00:00Z`），期望值不依赖跑用例当天的日期，任何一天运行结果一致。
+`2026-06-01T10:00:00Z`）；实时通道相关用例则通过把 `app` 内时钟
+（`app.store.utcnow` / `app.engine.utcnow`）冻结到固定锚点 `2026-06-01T12:00:00Z`
+并手动推进来模拟"短时间内连续提交"。期望值不依赖跑用例当天的日期，任何一天运行结果一致。
 
 ## 6. 模块结构
 
 ```
 app/models.py    枚举、值对象、业务异常、实时交易哨兵
-app/store.py     线程安全本地存储；评估原子占位与内容指纹；append-only 规则版本与生效时间选择；整批原子落库
+app/store.py     线程安全本地存储；评估原子占位与内容指纹；实时发生时刻冻结；live/historical 双通道计数；append-only 规则版本与生效时间选择；整批原子落库
 app/rules.py     规则批量校验（整批拒绝）
-app/engine.py    判定引擎：去重/并发/内容冲突、版本快照评估、按发生时刻补录、打分决策、历史重放、判定日志
+app/engine.py    判定引擎：去重/并发/内容冲突、版本快照评估、实时时刻冻结与按发生时刻补录、打分决策、历史重放、判定日志
 app/events.py    事件状态机与审计历史
 app/service.py   门面服务（账户/发布规则/实时提交/整批补录/重放/处置）
 app/api.py       FastAPI 入口与可区分错误码

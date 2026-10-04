@@ -35,14 +35,20 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def _txn_time(txn: Transaction) -> datetime:
-    """交易用于判定/计数的发生时刻；实时哨兵取当前时刻。"""
-    return utcnow() if txn.submitted_at == LIVE_SUBMISSION else _as_utc(txn.submitted_at)
+# velocity 计数的两个通道：实时提交与补录各自独立累计，互不污染。
+# - live：未显式给发生时间的实时交易，发生时刻在评估时冻结到 occurred_at；
+# - historical：补录（以及显式带发生时间）的交易，发生时刻取 submitted_at。
+CHANNEL_LIVE = "live"
+CHANNEL_HISTORICAL = "historical"
 
 
-def resolve_txn_time(txn: Transaction) -> datetime:
-    """交易发生时刻的公开解析入口：实时交易 -> 当前 UTC 时刻。"""
-    return _txn_time(txn)
+def txn_channel(txn: Transaction) -> str:
+    """一笔交易属于实时通道还是补录通道。"""
+    return (
+        CHANNEL_LIVE
+        if txn.submitted_at == LIVE_SUBMISSION
+        else CHANNEL_HISTORICAL
+    )
 
 
 class RiskStore:
@@ -54,6 +60,10 @@ class RiskStore:
         self.assessments: dict[str, Assessment] = {}
         # 进行中的评估占位：txn_id -> 提交内容，用于并发冲突与内容一致性检测
         self.in_flight: dict[str, Transaction] = {}
+        # 实时交易在评估时刻冻结的真实发生时刻：txn_id -> datetime(UTC)。
+        # 哨兵 Transaction 本身不可变，故另存一份；重放/计数都以它为准，
+        # 保证"首评 == 重放"且实时连续提交能按真实间隔进入时间窗。
+        self.occurred_at: dict[str, datetime] = {}
         # 规则版本（追加式，永不就地修改）
         self.rule_versions: list[RuleVersion] = []
         # 可疑事件
@@ -126,11 +136,22 @@ class RiskStore:
         with self._lock:
             self.in_flight.pop(txn_id, None)
 
-    def commit_assessment(self, txn: Transaction, assessment: Assessment) -> None:
-        """原子地落库交易与结论，并释放占位。"""
+    def commit_assessment(
+        self,
+        txn: Transaction,
+        assessment: Assessment,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        """原子地落库交易与结论，并释放占位。
+
+        实时交易（哨兵）必须传入评估时刻冻结的 ``occurred_at``，
+        作为后续 velocity 计数与默认重放选版的唯一时间口径。
+        """
         with self._lock:
             self.transactions.setdefault(txn.txn_id, txn)
             self.assessments[txn.txn_id] = assessment
+            if occurred_at is not None:
+                self.occurred_at.setdefault(txn.txn_id, _as_utc(occurred_at))
             self.in_flight.pop(txn.txn_id, None)
 
     def commit_batch(
@@ -163,31 +184,59 @@ class RiskStore:
         with self._lock:
             return self.transactions.get(txn_id)
 
+    def get_occurred_at(self, txn_id: str) -> datetime | None:
+        """实时交易冻结的发生时刻；非实时或不存在时返回 None。"""
+        with self._lock:
+            return self.occurred_at.get(txn_id)
+
+    def resolve_occurred_at(self, txn: Transaction) -> datetime:
+        """解析一笔（已落库或传入的）交易用于判定的发生时刻。
+
+        - 实时交易：返回评估落库时冻结的时刻，没有冻结记录时退化为当前时刻；
+        - 补录/显式时间交易：返回统一到 UTC 的 submitted_at。
+        """
+        if txn.submitted_at == LIVE_SUBMISSION:
+            frozen = self.occurred_at.get(txn.txn_id)
+            return frozen if frozen is not None else utcnow()
+        return _as_utc(txn.submitted_at)
+
     def count_account_transactions(
         self,
         account_id: str,
         after: datetime,
         at_or_before: datetime,
         extra: tuple[Transaction, ...] = (),
+        channel: str = CHANNEL_HISTORICAL,
     ) -> int:
-        """统计账户在 (after, at_or_before] 时间窗内提交的交易数。
+        """统计账户在 (after, at_or_before] 时间窗内、指定通道的交易数。
 
-        默认只数已落库交易；``extra`` 为补录批次中尚未落库的交易，
-        使同一批补录在窗口内互相可见，批次首评结论与落库后单独重放一致。
-        仅依据 submitted_at，因此任意时刻重放历史交易时，窗口都不会
-        滑入未来交易，结论可复现。
+        通道隔离：实时交易（``live``）与补录/显式时间交易（``historical``）
+        各自累计，时间窗计数互不污染。
+        ``extra`` 为同一补录批次中尚未落库的交易（均属 historical 通道），
+        使同批补录在窗口内互相可见，批次首评与落库后单独重放一致。
+        所有时间都按交易自身的冻结发生时刻取值，因此任意时刻重放，
+        窗口都不会滑入"之后"的交易，结论可复现。
         """
         after_u = _as_utc(after)
         before_u = _as_utc(at_or_before)
         with self._lock:
-            sources = list(self.transactions.values())
-            sources.extend(extra)
-            return sum(
-                1
-                for txn in sources
-                if txn.account_id == account_id
-                and after_u < _txn_time(txn) <= before_u
-            )
+            count = 0
+            for txn in self.transactions.values():
+                if txn_channel(txn) != channel:
+                    continue
+                if txn.account_id != account_id:
+                    continue
+                when = self.resolve_occurred_at(txn)
+                if after_u < when <= before_u:
+                    count += 1
+            if channel == CHANNEL_HISTORICAL:
+                for txn in extra:
+                    if txn.account_id != account_id:
+                        continue
+                    when = self.resolve_occurred_at(txn)
+                    if after_u < when <= before_u:
+                        count += 1
+            return count
 
     # ------------------------------------------------------------ 规则版本
 

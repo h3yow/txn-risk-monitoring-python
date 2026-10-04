@@ -47,10 +47,10 @@ def test_http_concurrent_submission_code():
     entered = threading.Event()
     original = engine_mod.AssessmentEngine._evaluate
 
-    def blocking(self, txn, rv, include_current):
+    def blocking(self, txn, rv, include_current, **_kw):
         entered.set()
         release.wait(timeout=5)
-        return original(self, txn, rv, include_current)
+        return original(self, txn, rv, include_current, **_kw)
 
     engine_mod.AssessmentEngine._evaluate = blocking
     try:

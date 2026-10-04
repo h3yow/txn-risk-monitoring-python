@@ -35,6 +35,10 @@ def _enable_engine_logs(caplog):
     caplog.set_level(logging.INFO, logger="risk.engine")
     caplog.set_level(logging.INFO, logger="risk.events")
     caplog.set_level(logging.INFO, logger="risk.service")
+    # 业务日志只保留 risk.* 三个 logger，屏蔽 httpx/uvicorn 等传输层噪音，
+    # 让实时日志能直接读出每个用例覆盖了哪块业务。
+    caplog.set_level(logging.WARNING, logger="httpx")
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @pytest.fixture

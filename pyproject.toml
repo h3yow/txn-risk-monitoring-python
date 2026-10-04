@@ -18,3 +18,9 @@ default = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+# 单测日志实时输出：可看到每条用例覆盖的业务（规则版本、命中依据、决策、
+# 事件流转、补录批次）。logger 在 tests/conftest.py 中开启到 INFO。
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(name)s | %(message)s"
+log_cli_date_format = "%H:%M:%S"
