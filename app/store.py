@@ -36,7 +36,12 @@ def _as_utc(dt: datetime) -> datetime:
 
 
 def _txn_time(txn: Transaction) -> datetime:
-    """交易用于判定/计数的发生时刻；实时哨兵取当前时刻。"""
+    """交易用于判定/计数的发生时刻；实时哨兵取当前时刻。
+
+    注意：对实时交易本函数每次调用都返回不同的"当前时刻"，只适用于
+    评估入口一次性解析；已落库交易的计数/重放必须改用
+    :meth:`RiskStore.occurred_time` 读取首评时冻结的时刻。
+    """
     return utcnow() if txn.submitted_at == LIVE_SUBMISSION else _as_utc(txn.submitted_at)
 
 
@@ -54,6 +59,11 @@ class RiskStore:
         self.assessments: dict[str, Assessment] = {}
         # 进行中的评估占位：txn_id -> 提交内容，用于并发冲突与内容一致性检测
         self.in_flight: dict[str, Transaction] = {}
+        # 已落库交易首评时冻结的发生时刻：txn_id -> occurred_at。
+        # 实时交易的 submitted_at 是哨兵值，若不冻结，每次计数都取新的
+        # utcnow()，会导致已落库实时交易永远落在窗口右边界之外（数不进窗口），
+        # 且重放窗口随重放时刻滑动、与首评对不上。
+        self.occurred_at: dict[str, datetime] = {}
         # 规则版本（追加式，永不就地修改）
         self.rule_versions: list[RuleVersion] = []
         # 可疑事件
@@ -126,11 +136,21 @@ class RiskStore:
         with self._lock:
             self.in_flight.pop(txn_id, None)
 
-    def commit_assessment(self, txn: Transaction, assessment: Assessment) -> None:
-        """原子地落库交易与结论，并释放占位。"""
+    def commit_assessment(
+        self,
+        txn: Transaction,
+        assessment: Assessment,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        """原子地落库交易与结论，并释放占位。
+
+        ``occurred_at`` 为首评时一次性解析的发生时刻（实时交易即评估入口的
+        utcnow()），随交易一起冻结，供后续窗口计数与重放使用。
+        """
         with self._lock:
             self.transactions.setdefault(txn.txn_id, txn)
             self.assessments[txn.txn_id] = assessment
+            self.occurred_at[txn.txn_id] = _as_utc(occurred_at or _txn_time(txn))
             self.in_flight.pop(txn.txn_id, None)
 
     def commit_batch(
@@ -151,6 +171,8 @@ class RiskStore:
             for txn, assessment, event in prepared:
                 self.transactions.setdefault(txn.txn_id, txn)
                 self.assessments[txn.txn_id] = assessment
+                # 补录交易的发生时刻即其显式 submitted_at，一并冻结登记
+                self.occurred_at[txn.txn_id] = _txn_time(txn)
                 self.in_flight.pop(txn.txn_id, None)
                 if event is not None:
                     self.events[event.event_id] = event
@@ -163,6 +185,16 @@ class RiskStore:
         with self._lock:
             return self.transactions.get(txn_id)
 
+    def occurred_time(self, txn: Transaction) -> datetime:
+        """交易用于窗口计数/重放的发生时刻。
+
+        已落库交易一律读首评时冻结的时刻（实时交易不再每次取新的 utcnow()）；
+        未落库交易（如补录批次内待落库笔）按 submitted_at 解析。
+        """
+        with self._lock:
+            frozen = self.occurred_at.get(txn.txn_id)
+        return frozen if frozen is not None else _txn_time(txn)
+
     def count_account_transactions(
         self,
         account_id: str,
@@ -172,21 +204,24 @@ class RiskStore:
     ) -> int:
         """统计账户在 (after, at_or_before] 时间窗内提交的交易数。
 
-        默认只数已落库交易；``extra`` 为补录批次中尚未落库的交易，
-        使同一批补录在窗口内互相可见，批次首评结论与落库后单独重放一致。
-        仅依据 submitted_at，因此任意时刻重放历史交易时，窗口都不会
-        滑入未来交易，结论可复现。
+        默认只数已落库交易（按首评冻结的发生时刻）；``extra`` 为补录批次中
+        尚未落库的交易，使同一批补录在窗口内互相可见，批次首评结论与落库后
+        单独重放一致。仅依据冻结/显式的发生时刻，因此任意时刻重放历史交易时，
+        窗口都不会滑入未来交易，结论可复现。
         """
         after_u = _as_utc(after)
         before_u = _as_utc(at_or_before)
         with self._lock:
-            sources = list(self.transactions.values())
-            sources.extend(extra)
+            sources = [
+                (txn, self.occurred_at.get(txn.txn_id))
+                for txn in self.transactions.values()
+            ]
+            sources.extend((txn, None) for txn in extra)
             return sum(
                 1
-                for txn in sources
+                for txn, frozen in sources
                 if txn.account_id == account_id
-                and after_u < _txn_time(txn) <= before_u
+                and after_u < (frozen or _txn_time(txn)) <= before_u
             )
 
     # ------------------------------------------------------------ 规则版本

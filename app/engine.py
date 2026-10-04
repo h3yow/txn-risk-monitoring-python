@@ -6,9 +6,12 @@
   在途占位且内容一致 -> ``ConcurrentSubmissionError``；
   同交易号但关键内容对不上 -> ``TransactionContentConflictError``，
   三种拒绝原因彼此可区分，且不会产生重复命中/计分/告警。
-- 实时交易按当前已生效版本判定；补录交易（``assess_historical``）按交易
-  自身发生时刻生效的版本判定，同批待落库交易进入 velocity 窗口，
-  使批次首评与落库后重放结论一致。
+- 实时交易按当前已生效版本判定，发生时刻在评估入口一次性解析并随结论
+  冻结落库：同一账户连续多笔实时交易据此进入 velocity 窗口累计，
+  重放时窗口不随重放时刻滑动，首评与重放结论逐项一致。
+- 补录交易（``assess_historical``）按交易自身发生时刻生效的版本判定，
+  同批待落库交易进入 velocity 窗口，使批次首评与落库后重放结论一致；
+  实时与补录的时间窗计数互不污染。
 - 结论中固化规则版本号与命中明细，规则版本只追加不改写，
   因此历史结论永不被后续规则升级影响，并可按当时版本原样重放。
 """
@@ -16,7 +19,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from app.models import (
     Assessment,
@@ -51,14 +54,21 @@ class AssessmentEngine:
         实时交易按"当前时刻已生效的最新规则版本"判定，行为与补录不同：
         补录交易按交易自身的发生时刻选取规则版本（见
         :meth:`RiskMonitoringService.backfill_transactions`）。
+
+        实时交易的发生时刻在评估入口一次性解析（utcnow()），并随结论一起
+        冻结落库：后续窗口计数与重放都读这个冻结时刻，保证同一账户连续
+        多笔实时交易能正常进入时间窗累计，且首评与重放结论一致。
         """
         self.store.claim_assessment(txn)
         try:
             rv = self.store.current_rule_version()
             if rv is None:
                 raise RuleValidationError("当前没有任何生效的规则版本，无法评估")
-            assessment = self._evaluate(txn, rv, include_current=True)
-            self.store.commit_assessment(txn, assessment)
+            occurred_at = resolve_txn_time(txn)
+            assessment = self._evaluate(
+                txn, rv, include_current=True, occurred_at=occurred_at
+            )
+            self.store.commit_assessment(txn, assessment, occurred_at=occurred_at)
             self._log_assessment(assessment, rv)
             return assessment
         except BaseException:
@@ -67,27 +77,35 @@ class AssessmentEngine:
             raise
 
     def replay(self, txn_id: str, version: int | None = None) -> Assessment:
-        """按指定（或当时生效的）规则版本复现历史交易的判定结果。
+        """按指定（或首评时生效的）规则版本复现历史交易的判定结果。
 
-        - ``version`` 为 None：取交易提交时刻生效的规则版本（与首次评估一致）。
+        - ``version`` 为 None：取首评结论固化的规则版本（与首次评估逐项一致；
+          首评结论缺失时退回"交易发生时刻生效的版本"）。
         - 显式传入版本号：可用新版本复算以展示升级带来的差异，
           但不会修改已落库的历史结论。
+
+        窗口计数使用首评时冻结的发生时刻，重放窗口不随重放时间滑动。
         """
         txn = self.store.get_transaction(txn_id)
         if txn is None:
             raise RuleValidationError(f"交易 {txn_id} 不存在，无法重放")
         if version is not None:
             rv = self.store.get_rule_version(version)
-        elif txn.submitted_at == LIVE_SUBMISSION:
-            # 实时交易：按重放时刻已生效的最新版本（通常与首评版本相同）
-            rv = self.store.current_rule_version()
-            if rv is None:
-                raise RuleValidationError("当前没有任何生效的规则版本，无法重放")
         else:
-            rv = self.store.effective_rule_version(txn.submitted_at)
+            stored = self.store.get_assessment(txn_id)
+            if stored is not None:
+                # 复现首评：版本、发生时刻都与首评完全一致
+                rv = self.store.get_rule_version(stored.rule_version)
+            elif txn.submitted_at == LIVE_SUBMISSION:
+                rv = self.store.current_rule_version()
+                if rv is None:
+                    raise RuleValidationError("当前没有任何生效的规则版本，无法重放")
+            else:
+                rv = self.store.effective_rule_version(txn.submitted_at)
         # 重放时交易已落库，时间窗查询会包含目标笔本身
         assessment = self._evaluate(
-            txn, rv, include_current=False, extra=()
+            txn, rv, include_current=False, extra=(),
+            occurred_at=self.store.occurred_time(txn),
         )
         self._log_assessment(assessment, rv, prefix="REPLAY")
         return assessment
@@ -107,7 +125,10 @@ class AssessmentEngine:
             raise RuleValidationError("补录交易必须显式给出真实发生时间 submitted_at")
         rv = self.store.effective_rule_version(txn.submitted_at)
         # extra 已含目标笔自身，统计口径与落库后重放完全一致，不再额外 +1
-        return self._evaluate(txn, rv, include_current=False, extra=extra)
+        return self._evaluate(
+            txn, rv, include_current=False, extra=extra,
+            occurred_at=resolve_txn_time(txn),
+        )
 
     # ------------------------------------------------------------ 评估内核
 
@@ -117,13 +138,16 @@ class AssessmentEngine:
         rv: RuleVersion,
         include_current: bool,
         extra: tuple[Transaction, ...] = (),
+        occurred_at: datetime | None = None,
     ) -> Assessment:
+        # 发生时刻由调用方一次性解析并贯穿整个评估；缺省时兜底解析一次
+        occurred_at = occurred_at or resolve_txn_time(txn)
         hits: list[RuleHit] = []
         score = 0
         for rule in rv.rules:
             if not rule.enabled:
                 continue
-            hit = self._check_rule(rule, txn, rv.version, include_current, extra)
+            hit = self._check_rule(rule, txn, rv.version, include_current, extra, occurred_at)
             if hit is not None:
                 hits.append(hit)
                 score += int(rule.params["score"])
@@ -151,6 +175,7 @@ class AssessmentEngine:
         version: int,
         include_current: bool,
         extra: tuple[Transaction, ...] = (),
+        occurred_at: datetime | None = None,
     ) -> RuleHit | None:
         p = rule.params
         if rule.rule_type == RuleType.AMOUNT_LIMIT:
@@ -171,7 +196,7 @@ class AssessmentEngine:
                 )
         elif rule.rule_type == RuleType.VELOCITY:
             window = timedelta(minutes=int(p["window_minutes"]))
-            occurred_at = resolve_txn_time(txn)
+            occurred_at = occurred_at or resolve_txn_time(txn)
             count = self.store.count_account_transactions(
                 txn.account_id,
                 after=occurred_at - window,
